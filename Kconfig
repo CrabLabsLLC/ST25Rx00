@@ -1,0 +1,195 @@
+# ST25Rx00 NFC Driver Kconfig
+# Copyright (c) 2025 NeuraSignal Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig ST25RX00
+	bool "ST25Rx00 NFC Reader Driver"
+	default n
+	depends on SPI && GPIO
+	help
+	  Enable driver for ST Microelectronics ST25R100/ST25R200 NFC readers.
+	  This driver provides support for NFC Forum compliant NFC readers
+	  using the ST RFAL (RF Abstraction Layer) library.
+
+if ST25RX00
+
+choice ST25RX00_CHIP_VARIANT
+	prompt "ST25Rx00 Chip Variant"
+	default ST25RX00_CHIP_ST25R200
+	help
+	  Select the specific ST25Rx00 chip variant in use.
+
+config ST25RX00_CHIP_ST25R100
+	bool "ST25R100"
+	help
+	  Enable support for ST25R100 NFC reader chip.
+	  Maximum SPI frequency: 6 MHz.
+
+config ST25RX00_CHIP_ST25R200
+	bool "ST25R200"
+	help
+	  Enable support for ST25R200 NFC reader chip.
+	  Maximum SPI frequency: 10 MHz.
+
+endchoice
+
+config ST25RX00_INIT_PRIORITY
+	int "ST25Rx00 initialization priority"
+	default 80
+	help
+	  ST25Rx00 driver initialization priority. Must be higher than
+	  SPI and GPIO initialization priorities.
+
+config ST25RX00_THREAD_STACK_SIZE
+	int "ST25Rx00 driver thread stack size"
+	default 2048
+	help
+	  Stack size for the ST25Rx00 driver thread. The RFAL library
+	  requires adequate stack space for NFC protocol processing.
+
+config ST25RX00_THREAD_PRIORITY
+	int "ST25Rx00 driver thread priority"
+	default 7
+	help
+	  Priority of the ST25Rx00 driver thread. Should be high enough
+	  to ensure timely NFC communication but lower than critical
+	  system threads.
+
+config ST25RX00_POLL_IRQ
+	bool "Poll IRQ pin instead of using interrupts"
+	default n
+	help
+	  If enabled, the driver will poll the IRQ pin instead of using
+	  GPIO interrupts. This can be useful for debugging or on platforms
+	  with limited interrupt support.
+
+menu "RFAL Feature Configuration"
+
+config ST25RX00_FEATURE_LISTEN_MODE
+	bool "Enable Listen Mode (Card Emulation)"
+	default n
+	help
+	  Enable RFAL support for Listen Mode (Card Emulation).
+	  Note: ST25R100/ST25R200 do not support passive listen mode.
+
+config ST25RX00_FEATURE_WAKEUP_MODE
+	bool "Enable Wake-Up Mode"
+	default y
+	help
+	  Enable RFAL support for Wake-Up mode for low-power tag detection.
+
+config ST25RX00_FEATURE_LOWPOWER_MODE
+	bool "Enable Low Power Mode"
+	default n
+	help
+	  Enable RFAL support for Low Power mode.
+
+config ST25RX00_FEATURE_NFCA
+	bool "Enable NFC-A (ISO14443A)"
+	default y
+	help
+	  Enable RFAL support for NFC-A (ISO14443A) technology.
+
+config ST25RX00_FEATURE_NFCB
+	bool "Enable NFC-B (ISO14443B)"
+	default y
+	help
+	  Enable RFAL support for NFC-B (ISO14443B) technology.
+
+config ST25RX00_FEATURE_NFCF
+	bool "Enable NFC-F (FeliCa)"
+	default n
+	help
+	  Enable RFAL support for NFC-F (FeliCa) technology.
+	  Note: ST25R100/ST25R200 have limited NFC-F support.
+
+config ST25RX00_FEATURE_NFCV
+	bool "Enable NFC-V (ISO15693)"
+	default y
+	help
+	  Enable RFAL support for NFC-V (ISO15693) technology.
+
+config ST25RX00_FEATURE_T1T
+	bool "Enable Type 1 Tag support"
+	default y
+	depends on ST25RX00_FEATURE_NFCA
+	help
+	  Enable RFAL support for Type 1 Tags (Topaz).
+
+config ST25RX00_FEATURE_T2T
+	bool "Enable Type 2 Tag support"
+	default y
+	depends on ST25RX00_FEATURE_NFCA
+	help
+	  Enable RFAL support for Type 2 Tags (NTAG, Ultralight).
+
+config ST25RX00_FEATURE_T4T
+	bool "Enable Type 4 Tag support"
+	default y
+	depends on ST25RX00_FEATURE_NFCA
+	help
+	  Enable RFAL support for Type 4 Tags (ISO-DEP).
+
+config ST25RX00_FEATURE_ST25TB
+	bool "Enable ST25TB support"
+	default y
+	depends on ST25RX00_FEATURE_NFCB
+	help
+	  Enable RFAL support for ST25TB NFC-B tags.
+
+config ST25RX00_FEATURE_ST25XV
+	bool "Enable ST25xV support"
+	default y
+	depends on ST25RX00_FEATURE_NFCV
+	help
+	  Enable RFAL support for ST25xV ISO15693 tags.
+
+config ST25RX00_FEATURE_ISO_DEP
+	bool "Enable ISO-DEP (ISO14443-4)"
+	default y
+	depends on ST25RX00_FEATURE_NFCA || ST25RX00_FEATURE_NFCB
+	help
+	  Enable RFAL support for ISO-DEP (ISO14443-4) protocol.
+
+config ST25RX00_FEATURE_NFC_DEP
+	bool "Enable NFC-DEP (P2P)"
+	default n
+	depends on ST25RX00_FEATURE_NFCA && ST25RX00_FEATURE_NFCF
+	help
+	  Enable RFAL support for NFC-DEP (NFCIP1/P2P) protocol.
+	  Requires both NFC-A and NFC-F support.
+
+config ST25RX00_FEATURE_CD
+	bool "Enable Collision Detection"
+	default y
+	help
+	  Enable RFAL Collision Detection feature.
+
+config ST25RX00_ISO_DEP_IBLOCK_MAX_LEN
+	int "ISO-DEP I-Block maximum length"
+	default 256
+	depends on ST25RX00_FEATURE_ISO_DEP
+	help
+	  Maximum length of ISO-DEP I-Block in bytes.
+	  Valid values: 16, 24, 32, 40, 48, 64, 96, 128, 256.
+
+config ST25RX00_ISO_DEP_APDU_MAX_LEN
+	int "ISO-DEP APDU maximum length"
+	default 512
+	depends on ST25RX00_FEATURE_ISO_DEP
+	help
+	  Maximum length of ISO-DEP APDU in bytes.
+
+config ST25RX00_NFC_RF_BUF_LEN
+	int "NFC RF buffer length"
+	default 258
+	help
+	  RF buffer length used by RFAL NFC layer.
+
+endmenu # RFAL Feature Configuration
+
+module = ST25RX00
+module-str = st25rx00
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # ST25RX00

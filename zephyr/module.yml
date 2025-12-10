@@ -1,0 +1,10 @@
+# ST25Rx00 NFC Driver Zephyr Module Definition
+# Copyright (c) 2025 NeuraSignal Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: st25rx00
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    dts_root: .
