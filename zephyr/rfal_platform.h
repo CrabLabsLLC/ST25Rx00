@@ -48,6 +48,26 @@ extern "C" {
 #define ST25R_COM_SINGLETXRX
 
 /*
+ * IRQ Mode Configuration (via CONFIG_ST25RX00_IRQ_POLLING):
+ *
+ * POLLING MODE (CONFIG_ST25RX00_IRQ_POLLING=y):
+ *   - RFAL polls GPIO directly via platformGpioIsHigh()
+ *   - Simpler, works reliably during initialization
+ *   - Higher CPU usage during NFC operations
+ *   - Good for debugging and simple applications
+ *
+ * INTERRUPT MODE (CONFIG_ST25RX00_IRQ_POLLING=n, default):
+ *   - Hardware GPIO interrupt triggers ISR
+ *   - ISR sets flag and defers work to system work queue
+ *   - Low power (CPU can sleep while waiting for NFC events)
+ *   - SPI operations run in thread context (work queue)
+ *   - Recommended for production use
+ */
+#ifdef CONFIG_ST25RX00_IRQ_POLLING
+#define ST25R_POLL_IRQ
+#endif
+
+/*
  ******************************************************************************
  * RFAL FEATURE CONFIGURATION (from Kconfig)
  ******************************************************************************
@@ -185,6 +205,13 @@ extern "C" {
 #define ST25R_RESET_PORT                NULL
 #define ST25R_RESET_PIN                 0U
 
+/* LED pin definitions - enables LED event macros in st25r200_com.c */
+#define PLATFORM_LED_RX_PORT            NULL
+#define PLATFORM_LED_RX_PIN             0U
+#define PLATFORM_LED_FIELD_PORT         NULL
+#define PLATFORM_LED_FIELD_PIN          1U
+#define PLATFORM_LED_CONN_PIN           2U   /* Connection/tag presence LED */
+
 /*
  ******************************************************************************
  * GLOBAL MACROS
@@ -201,10 +228,10 @@ extern "C" {
 #define platformIrqST25RPinInitialize()         rfal_platform_irq_init()
 #define platformIrqST25RSetCallback(cb)         rfal_platform_irq_set_callback(cb)
 
-#define platformLedsInitialize()                /* LEDs initialized by Zephyr */
-#define platformLedOff(port, pin)               rfal_platform_led_off()
-#define platformLedOn(port, pin)                rfal_platform_led_on()
-#define platformLedToggle(port, pin)            /* Not implemented */
+#define platformLedsInitialize()                rfal_platform_leds_init()
+#define platformLedOff(port, pin)               rfal_platform_led_off(pin)
+#define platformLedOn(port, pin)                rfal_platform_led_on(pin)
+#define platformLedToggle(port, pin)            rfal_platform_led_toggle(pin)
 
 #define platformGpioSet(port, pin)              rfal_platform_gpio_set(pin)
 #define platformGpioClear(port, pin)            rfal_platform_gpio_clear(pin)
@@ -246,15 +273,16 @@ struct st25rx00_config {
     struct gpio_dt_spec cs_gpio;           /**< Chip select (manually controlled) */
     struct gpio_dt_spec irq_gpio;
     struct gpio_dt_spec reset_gpio;
-    struct gpio_dt_spec led_field_gpio;
-    struct gpio_dt_spec led_rx_gpio;
-    struct gpio_dt_spec led_tx_gpio;
-    struct gpio_dt_spec led_error_gpio;
+    struct gpio_dt_spec led_field_gpio;    /**< Field/TX active LED */
+    struct gpio_dt_spec led_rx_gpio;       /**< RX activity LED */
+    struct gpio_dt_spec led_tx_gpio;       /**< TX activity LED */
+    struct gpio_dt_spec led_error_gpio;    /**< Error indicator LED */
+    struct gpio_dt_spec led_conn_gpio;     /**< Tag presence/connection LED */
 };
 
 /** ST25Rx00 device runtime data */
 struct st25rx00_data {
-    struct gpio_callback irq_cb;
+    struct gpio_callback irq_cb;   /**< IRQ callback (used in interrupt mode) */
     bool initialized;
 };
 
@@ -367,14 +395,35 @@ int rfal_platform_spi_txrx(const uint8_t *txBuf, uint8_t *rxBuf, uint16_t len);
 void rfal_platform_error_handle(void);
 
 /**
- * @brief Turn on field LED
+ * @brief Initialize LEDs
  */
-void rfal_platform_led_on(void);
+void rfal_platform_leds_init(void);
 
 /**
- * @brief Turn off field LED
+ * @brief Turn on LED by pin identifier
+ * @param pin LED pin identifier (PLATFORM_LED_RX_PIN or PLATFORM_LED_FIELD_PIN)
  */
-void rfal_platform_led_off(void);
+void rfal_platform_led_on(uint32_t pin);
+
+/**
+ * @brief Turn off LED by pin identifier
+ * @param pin LED pin identifier (PLATFORM_LED_RX_PIN or PLATFORM_LED_FIELD_PIN)
+ */
+void rfal_platform_led_off(uint32_t pin);
+
+/**
+ * @brief Toggle LED by pin identifier
+ * @param pin LED pin identifier (PLATFORM_LED_RX_PIN or PLATFORM_LED_FIELD_PIN)
+ */
+void rfal_platform_led_toggle(uint32_t pin);
+
+/**
+ * @brief Clear the IRQ signal flag
+ *
+ * Call this after processing interrupts to reset the internal state.
+ * This allows fresh detection of new interrupt events.
+ */
+void rfal_platform_irq_clear(void);
 
 #ifdef __cplusplus
 }

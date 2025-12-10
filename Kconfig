@@ -55,13 +55,16 @@ config ST25RX00_THREAD_PRIORITY
 	  to ensure timely NFC communication but lower than critical
 	  system threads.
 
-config ST25RX00_POLL_IRQ
-	bool "Poll IRQ pin instead of using interrupts"
+config ST25RX00_IRQ_POLLING
+	bool "Use IRQ polling mode instead of interrupts"
 	default n
 	help
-	  If enabled, the driver will poll the IRQ pin instead of using
-	  GPIO interrupts. This can be useful for debugging or on platforms
-	  with limited interrupt support.
+	  Select the IRQ handling mode:
+	  - If disabled (default): Hardware GPIO interrupts with work queue
+	    deferral. Lower power, CPU can sleep while waiting for NFC events.
+	    Recommended for production use.
+	  - If enabled: RFAL library polls the GPIO directly. Simpler, good
+	    for debugging, but higher CPU usage during NFC operations.
 
 menu "RFAL Feature Configuration"
 

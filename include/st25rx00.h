@@ -216,6 +216,73 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
                                uint8_t *rx_buf, size_t rx_buf_len,
                                size_t *rx_len);
 
+/**
+ * @brief Wait for NFC interrupt with timeout
+ *
+ * Blocks waiting for an NFC interrupt signal. Use this in an NFC
+ * processing thread to efficiently wait for events instead of polling.
+ *
+ * After this returns, call st25rx00_worker() to process the event.
+ *
+ * @param timeout Timeout specification (K_FOREVER, K_MSEC(x), etc.)
+ * @return 0 if interrupt occurred, -EAGAIN on timeout
+ */
+int st25rx00_wait_for_irq(k_timeout_t timeout);
+
+/*
+ ******************************************************************************
+ * NFC THREAD ENTRY FUNCTION
+ ******************************************************************************
+ */
+
+/** Tag event callback type */
+typedef void (*st25rx00_tag_callback_t)(const struct st25rx00_tag_info *tag);
+
+/**
+ * @brief Set callback for tag detection events
+ *
+ * Register a callback that will be called when a tag is detected.
+ * The callback runs in the NFC thread context.
+ *
+ * @param cb Callback function (NULL to disable)
+ */
+void st25rx00_set_tag_callback(st25rx00_tag_callback_t cb);
+
+/**
+ * @brief NFC thread entry function
+ *
+ * This function should be used as the entry point for a dedicated NFC
+ * processing thread. It initializes the NFC stack, starts discovery,
+ * and continuously processes NFC events.
+ *
+ * Example usage in main.c:
+ * @code
+ * K_THREAD_STACK_DEFINE(nfc_stack, 3072);
+ * struct k_thread nfc_thread;
+ *
+ * int main(void) {
+ *     st25rx00_set_tag_callback(my_tag_handler);
+ *     k_thread_create(&nfc_thread, nfc_stack, 3072,
+ *                     st25rx00_thread_entry, NULL, NULL, NULL,
+ *                     5, 0, K_NO_WAIT);
+ *     ...
+ * }
+ * @endcode
+ *
+ * @param p1 Unused (for Zephyr thread compatibility)
+ * @param p2 Unused
+ * @param p3 Unused
+ */
+void st25rx00_thread_entry(void *p1, void *p2, void *p3);
+
+/**
+ * @brief Stop the NFC thread
+ *
+ * Signals the NFC thread to stop processing and exit cleanly.
+ * Call this before destroying the thread.
+ */
+void st25rx00_thread_stop(void);
+
 /*
  ******************************************************************************
  * RFAL DIRECT ACCESS

@@ -9,6 +9,7 @@
  */
 
 #include "rfal_platform.h"
+#include <zephyr/sys/atomic.h>
 
 LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
 
@@ -41,20 +42,38 @@ LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
 /** Pointer to the device instance - set during initialization */
 static const struct device *st25rx00_dev;
 
-/** Mutex for protecting SPI communication */
-static struct k_mutex platform_mutex;
+/*
+ * THREAD SAFETY:
+ *
+ * This driver is NOT thread-safe. All NFC operations must be called from
+ * a single thread context. The ST RFAL library makes nested/re-entrant SPI
+ * calls internally which would deadlock with mutex protection.
+ *
+ * IRQ Handling Architecture (Interrupt Mode - default):
+ *
+ * The ST RFAL library has blocking spin loops that don't yield to the
+ * scheduler. During these waits, the library polls platformGpioIsHigh()
+ * to check for pending interrupts. We use this as an opportunity to
+ * process interrupts synchronously when detected.
+ *
+ * Flow:
+ * 1. Hardware IRQ fires -> GPIO ISR gives semaphore
+ * 2. NFC thread wakes from semaphore wait
+ * 3. NFC thread calls rfalWorker() which processes interrupts via SPI
+ * 4. RFAL state machine advances
+ *
+ * The semaphore provides proper kernel-level wake/sleep for low power.
+ * The platformGpioIsHigh() fallback ensures interrupts are processed
+ * even during tight RFAL spin loops that don't yield.
+ */
 
-/** Flag indicating if mutex has been initialized */
-static bool mutex_initialized = false;
-
-/** Work item for deferring ISR processing to thread context */
-static struct k_work irq_work;
-
-/** Callback function to invoke from work handler */
-static void (*deferred_isr_callback)(void);
-
-/** Flag to prevent duplicate work submissions */
-static volatile bool irq_pending = false;
+#ifndef CONFIG_ST25RX00_IRQ_POLLING
+/* Interrupt mode state */
+static void (* volatile isr_callback)(void);  /* Pointer is volatile, not return type */
+static atomic_t irq_pending;  /* Atomic flag for IRQ pending state */
+static struct k_sem irq_sem;  /* Semaphore for thread wakeup */
+static bool irq_initialized;  /* Guard against double-init */
+#endif
 
 /** Temporary buffer for same-buffer SPI TX/RX operations */
 static uint8_t spi_temp_buf[SPI_TEMP_BUF_SIZE];
@@ -75,12 +94,6 @@ int rfal_platform_init(const struct device *dev)
 
     /* Store device pointer for platform functions */
     st25rx00_dev = dev;
-
-    /* Initialize mutex for communication protection */
-    if (!mutex_initialized) {
-        k_mutex_init(&platform_mutex);
-        mutex_initialized = true;
-    }
 
     /* Check SPI bus is ready */
     if (!spi_is_ready_dt(&config->spi)) {
@@ -167,18 +180,12 @@ int rfal_platform_init(const struct device *dev)
 
 void rfal_platform_protect_comm(void)
 {
-    /* Use mutex instead of irq_lock to allow blocking SPI operations.
-     * Only lock if not in ISR context - ISR should not do SPI operations. */
-    if (!k_is_in_isr() && mutex_initialized) {
-        k_mutex_lock(&platform_mutex, K_FOREVER);
-    }
+    /* No-op - driver is single-threaded by design (see THREAD SAFETY note above) */
 }
 
 void rfal_platform_unprotect_comm(void)
 {
-    if (!k_is_in_isr() && mutex_initialized) {
-        k_mutex_unlock(&platform_mutex);
-    }
+    /* No-op - driver is single-threaded by design */
 }
 
 void rfal_platform_protect_irq_status(void)
@@ -236,8 +243,65 @@ bool rfal_platform_gpio_is_high(uint32_t pin)
 
     const struct st25rx00_config *config = st25rx00_dev->config;
 
-    /* This is called for IRQ pin */
-    return (gpio_pin_get_dt(&config->irq_gpio) != 0);
+    /*
+     * Check if the IRQ pin is active (interrupt pending).
+     *
+     * The ST25R IRQ is active-LOW on hardware. With GPIO_ACTIVE_LOW flag,
+     * gpio_pin_get_dt() returns 1 when active (physically LOW).
+     *
+     * This function is called by st25r200CheckForReceivedInterrupts() in
+     * polling mode to check for pending interrupts. In interrupt mode,
+     * it's also called during spin waits, giving us an opportunity to
+     * process any pending interrupts synchronously.
+     */
+#ifdef CONFIG_ST25RX00_IRQ_POLLING
+    /* Polling mode: read GPIO directly */
+    int gpio_val = gpio_pin_get_dt(&config->irq_gpio);
+    if (gpio_val < 0) {
+        LOG_ERR("GPIO read failed: %d", gpio_val);
+        return false;
+    }
+    return (gpio_val != 0);
+#else
+    /*
+     * Interrupt mode: Check both the pending flag and GPIO state.
+     *
+     * irq_pending is set by the GPIO ISR on falling edge.
+     * We also check GPIO directly as fallback for:
+     * - Interrupts pending before ISR was configured
+     * - Level-triggered behavior (IRQ stays low until serviced)
+     *
+     * Use atomic_clear() to atomically read and clear the flag.
+     * This prevents race condition where ISR fires between read and clear.
+     */
+    bool was_pending = atomic_clear(&irq_pending);
+
+    /* Read GPIO with proper error handling */
+    int gpio_val = gpio_pin_get_dt(&config->irq_gpio);
+    if (gpio_val < 0) {
+        LOG_ERR("GPIO read failed: %d", gpio_val);
+        return was_pending;  /* Return pending flag even on error */
+    }
+    bool gpio_active = (gpio_val != 0);
+    bool active = was_pending || gpio_active;
+
+    if (active && isr_callback != NULL) {
+        /*
+         * Process interrupt synchronously. This is critical because:
+         * 1. RFAL's spin loops don't yield to the scheduler
+         * 2. We must update interrupt status during the spin wait
+         * 3. SPI reads are safe here - we're in thread context
+         *
+         * The callback (st25r200Isr) will:
+         * - Read IRQ status registers via SPI
+         * - Clear hardware interrupt flags
+         * - Update RFAL's internal interrupt status
+         */
+        isr_callback();
+    }
+
+    return active;
+#endif
 }
 
 /*
@@ -246,25 +310,41 @@ bool rfal_platform_gpio_is_high(uint32_t pin)
  ******************************************************************************
  */
 
-/**
- * Work handler - executes in thread context, safe for SPI operations
+#ifdef CONFIG_ST25RX00_IRQ_POLLING
+
+/*
+ * Polling Mode Implementation
+ * RFAL library polls GPIO directly - minimal stubs for API compatibility
  */
-static void irq_work_handler(struct k_work *work)
+
+void rfal_platform_irq_init(void)
 {
-    ARG_UNUSED(work);
-
-    /* Clear pending flag BEFORE calling callback to avoid missing new IRQs
-     * that might occur during callback execution */
-    irq_pending = false;
-
-    if (deferred_isr_callback != NULL) {
-        deferred_isr_callback();
-    }
+    LOG_DBG("IRQ mode: polling");
 }
 
+void rfal_platform_irq_set_callback(void (*cb)(void))
+{
+    ARG_UNUSED(cb);
+}
+
+void rfal_platform_irq_clear(void)
+{
+    /* Nothing to clear in polling mode */
+}
+
+#else /* Interrupt Mode */
+
+/*
+ * Interrupt Mode Implementation
+ *
+ * Minimal ISR that just sets a flag. All actual interrupt processing
+ * happens synchronously in platformGpioIsHigh() when RFAL polls it.
+ * This avoids the need for work queue deferral and its complexity.
+ */
+
 /**
- * GPIO IRQ handler - runs in ISR context, cannot do SPI
- * Defers work to system work queue for thread context execution
+ * GPIO IRQ handler - runs in ISR context
+ * Sets atomic flag and gives semaphore to wake NFC thread
  */
 static void rfal_platform_irq_handler(const struct device *dev,
                                       struct gpio_callback *cb,
@@ -274,12 +354,8 @@ static void rfal_platform_irq_handler(const struct device *dev,
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
 
-    /* Submit work to system work queue - this defers execution to thread context
-     * where blocking SPI operations are allowed */
-    if (!irq_pending) {
-        irq_pending = true;
-        k_work_submit(&irq_work);
-    }
+    atomic_set(&irq_pending, 1);
+    k_sem_give(&irq_sem);
 }
 
 void rfal_platform_irq_init(void)
@@ -289,39 +365,58 @@ void rfal_platform_irq_init(void)
         return;
     }
 
+    /* Guard against multiple initializations.
+     * RFAL calls this during st25r200Initialize() which may be called
+     * multiple times (driver init + rfalNfcInitialize). */
+    if (irq_initialized) {
+        LOG_DBG("IRQ already initialized, skipping");
+        return;
+    }
+
     const struct st25rx00_config *config = st25rx00_dev->config;
     struct st25rx00_data *data = st25rx00_dev->data;
     int ret;
 
-    /* Initialize work item for deferred ISR processing */
-    k_work_init(&irq_work, irq_work_handler);
+    /* Reset state using atomic operations */
+    atomic_clear(&irq_pending);
+    isr_callback = NULL;
 
-    /* Initialize GPIO callback */
+    /* Initialize semaphore for thread synchronization */
+    k_sem_init(&irq_sem, 0, 1);
+
+    /* Initialize and add GPIO callback */
     gpio_init_callback(&data->irq_cb, rfal_platform_irq_handler,
                        BIT(config->irq_gpio.pin));
 
-    /* Add callback */
     ret = gpio_add_callback(config->irq_gpio.port, &data->irq_cb);
     if (ret < 0) {
         LOG_ERR("Failed to add IRQ callback: %d", ret);
         return;
     }
 
-    /* Configure interrupt on edge to active (falling edge for active-low IRQ) */
+    /* Configure edge-triggered interrupt on falling edge.
+     * GPIO_INT_EDGE_TO_ACTIVE with GPIO_ACTIVE_LOW means falling edge. */
     ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
     if (ret < 0) {
-        LOG_ERR("Failed to configure IRQ interrupt: %d", ret);
+        LOG_ERR("Failed to configure IRQ: %d", ret);
         return;
     }
 
-    LOG_DBG("IRQ configured with work queue deferral");
+    irq_initialized = true;
+    LOG_DBG("IRQ mode: interrupt (edge-triggered)");
 }
 
 void rfal_platform_irq_set_callback(void (*cb)(void))
 {
-    /* Store callback for deferred execution in work queue handler */
-    deferred_isr_callback = cb;
+    isr_callback = cb;
 }
+
+void rfal_platform_irq_clear(void)
+{
+    atomic_clear(&irq_pending);
+}
+
+#endif /* CONFIG_ST25RX00_IRQ_POLLING */
 
 /*
  ******************************************************************************
@@ -482,31 +577,58 @@ int rfal_platform_spi_txrx(const uint8_t *txBuf, uint8_t *rxBuf, uint16_t len)
  ******************************************************************************
  * LED FUNCTIONS
  ******************************************************************************
+ *
+ * LED control uses the device tree configuration from the st25rx00 node.
+ * All LED GPIOs are optional - if not defined in device tree, the LED
+ * functions become no-ops.
  */
 
-void rfal_platform_led_on(void)
+static const struct gpio_dt_spec *get_led_gpio(uint32_t pin)
 {
     if (st25rx00_dev == NULL) {
-        return;
+        return NULL;
     }
 
     const struct st25rx00_config *config = st25rx00_dev->config;
 
-    if (config->led_field_gpio.port != NULL) {
-        gpio_pin_set_dt(&config->led_field_gpio, 1);
+    switch (pin) {
+    case PLATFORM_LED_RX_PIN:
+        return (config->led_rx_gpio.port != NULL) ? &config->led_rx_gpio : NULL;
+    case PLATFORM_LED_FIELD_PIN:
+        return (config->led_field_gpio.port != NULL) ? &config->led_field_gpio : NULL;
+    case PLATFORM_LED_CONN_PIN:
+        return (config->led_conn_gpio.port != NULL) ? &config->led_conn_gpio : NULL;
+    default:
+        return NULL;
     }
 }
 
-void rfal_platform_led_off(void)
+void rfal_platform_leds_init(void)
 {
-    if (st25rx00_dev == NULL) {
-        return;
+    /* LEDs are already configured in rfal_platform_init() */
+}
+
+void rfal_platform_led_on(uint32_t pin)
+{
+    const struct gpio_dt_spec *gpio = get_led_gpio(pin);
+    if (gpio != NULL) {
+        gpio_pin_set_dt(gpio, 1);
     }
+}
 
-    const struct st25rx00_config *config = st25rx00_dev->config;
+void rfal_platform_led_off(uint32_t pin)
+{
+    const struct gpio_dt_spec *gpio = get_led_gpio(pin);
+    if (gpio != NULL) {
+        gpio_pin_set_dt(gpio, 0);
+    }
+}
 
-    if (config->led_field_gpio.port != NULL) {
-        gpio_pin_set_dt(&config->led_field_gpio, 0);
+void rfal_platform_led_toggle(uint32_t pin)
+{
+    const struct gpio_dt_spec *gpio = get_led_gpio(pin);
+    if (gpio != NULL) {
+        gpio_pin_toggle_dt(gpio);
     }
 }
 
@@ -528,4 +650,22 @@ void rfal_platform_error_handle(void)
      */
 
     /* Don't halt - allow caller to handle error */
+}
+
+/*
+ ******************************************************************************
+ * IRQ WAIT API (for thread-based NFC processing)
+ ******************************************************************************
+ */
+
+int st25rx00_wait_for_irq(k_timeout_t timeout)
+{
+#ifdef CONFIG_ST25RX00_IRQ_POLLING
+    /* In polling mode, just yield briefly - no semaphore */
+    k_sleep(K_MSEC(1));
+    return 0;
+#else
+    /* Wait on IRQ semaphore - woken by GPIO ISR */
+    return k_sem_take(&irq_sem, timeout);
+#endif
 }

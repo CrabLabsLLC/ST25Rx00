@@ -85,3 +85,9 @@ properties:
     description: |
       Optional GPIO pin for NFC error LED indicator.
       Turns on when CRC, parity, or framing errors occur.
+
+  led-conn-gpios:
+    type: phandle-array
+    description: |
+      Optional GPIO pin for NFC connection LED indicator.
+      Turns on when an NFC tag is detected/activated in the field.
