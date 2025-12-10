@@ -8,14 +8,19 @@ description: |
   These devices implement NFC Forum compliant NFC reader/writer functionality
   supporting NFC-A, NFC-B, NFC-F, and NFC-V technologies.
 
+  Note: All GPIO properties use the '-gpios' suffix as required by Zephyr's
+  device tree binding infrastructure, even though each property specifies
+  only a single GPIO pin.
+
   Example:
     &spi1 {
-        st25r100: st25r100@1 {
+        st25r100: st25r100@0 {
             compatible = "st,st25rx00";
-            reg = <1>;
-            spi-max-frequency = <6000000>;
+            reg = <0>;
+            spi-max-frequency = <4000000>;
+            cs-gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
             irq-gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-            reset-gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+            reset-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
         };
     };
 
@@ -24,49 +29,59 @@ compatible: "st,st25rx00"
 include: spi-device.yaml
 
 properties:
+  cs-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      GPIO pin connected to the ST25Rx00 chip select (SS/~CS) pin.
+      Active LOW. The driver manually controls this pin to support
+      multi-byte SPI transactions required by the RFAL library.
+      Do NOT include this pin in the SPI controller's cs-gpios property.
+
   irq-gpios:
     type: phandle-array
     required: true
     description: |
-      GPIO connected to the ST25Rx00 IRQ (interrupt) pin.
-      This pin is active LOW and should be configured with GPIO_ACTIVE_LOW.
-      The pin should have an external or internal pull-up resistor.
+      GPIO pin connected to the ST25Rx00 IRQ (interrupt) output.
+      Active LOW - asserted when the chip has pending interrupts.
+      Should be configured with GPIO_ACTIVE_LOW and an internal pull-up.
 
   reset-gpios:
     type: phandle-array
     required: true
     description: |
-      GPIO connected to the ST25Rx00 RESET pin.
-      This pin is active LOW and should be configured with GPIO_ACTIVE_LOW.
-      Reset is used to hardware reset the NFC reader IC during initialization.
+      GPIO pin connected to the ST25Rx00 RESET input.
+      ST25R100: Active HIGH (drive high to reset, low for normal operation).
+      ST25R200: Active LOW (drive low to reset, high for normal operation).
+      Used to hardware reset the NFC reader IC during initialization.
 
   spi-max-frequency:
     description: |
       Maximum SPI clock frequency for communication with the ST25Rx00.
       ST25R100: Maximum 6 MHz
       ST25R200: Maximum 10 MHz
-      Default value depends on chip variant selection in Kconfig.
+      Recommended: 4 MHz for reliable operation.
 
   led-field-gpios:
     type: phandle-array
     description: |
-      Optional GPIO for NFC field LED indicator.
+      Optional GPIO pin for NFC field LED indicator.
       Turns on when RF field is active.
 
   led-rx-gpios:
     type: phandle-array
     description: |
-      Optional GPIO for NFC RX LED indicator.
+      Optional GPIO pin for NFC RX LED indicator.
       Turns on during reception of NFC data.
 
   led-tx-gpios:
     type: phandle-array
     description: |
-      Optional GPIO for NFC TX LED indicator.
+      Optional GPIO pin for NFC TX LED indicator.
       Turns on during transmission of NFC data.
 
   led-error-gpios:
     type: phandle-array
     description: |
-      Optional GPIO for NFC error LED indicator.
+      Optional GPIO pin for NFC error LED indicator.
       Turns on when CRC, parity, or framing errors occur.

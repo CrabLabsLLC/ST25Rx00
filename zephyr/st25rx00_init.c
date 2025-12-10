@@ -39,7 +39,8 @@ LOG_MODULE_REGISTER(st25rx00, CONFIG_ST25RX00_LOG_LEVEL);
 static int st25rx00_init(const struct device *dev)
 {
     int ret;
-    uint8_t chip_rev;
+    uint8_t chip_id;
+    const struct st25rx00_config *config = dev->config;
 
     LOG_INF("Initializing ST25Rx00 NFC Reader");
 
@@ -50,30 +51,55 @@ static int st25rx00_init(const struct device *dev)
         return ret;
     }
 
-    /* Perform hardware reset sequence */
-    LOG_DBG("Performing hardware reset");
+    /* Perform hardware reset sequence with proper timing */
+    LOG_INF("Performing hardware reset sequence");
 
-    /* Assert reset */
-    rfal_platform_gpio_set(0);
+    /* Check reset pin state */
+    LOG_INF("Reset GPIO port: %s, pin: %d", config->reset_gpio.port->name, config->reset_gpio.pin);
+
+    /* ST25R100 RESET is ACTIVE HIGH:
+     * - To reset: drive pin HIGH (logic 1)
+     * - Normal operation: drive pin LOW (logic 0)
+     * Pull-down ensures valid LOW state when released.
+     */
+
+    /* Ensure reset is released first (LOW = not in reset) */
+    gpio_pin_set_dt(&config->reset_gpio, 0);
     k_msleep(10);
 
-    /* Release reset */
-    rfal_platform_gpio_clear(0);
-    k_msleep(10);
+    /* Assert reset (HIGH = reset active) */
+    LOG_INF("Asserting reset (driving HIGH)...");
+    gpio_pin_set_dt(&config->reset_gpio, 1);
+    k_msleep(5);  /* Hold reset for 5ms */
 
-    /* Initialize the ST25R200 chip */
+    /* Release reset (LOW = normal operation) - chip needs time for crystal to stabilize */
+    LOG_INF("Releasing reset (driving LOW for normal operation)...");
+    gpio_pin_set_dt(&config->reset_gpio, 0);
+    k_msleep(100);  /* Give crystal time to stabilize (27.12 MHz with 4pF load) */
+
+    LOG_INF("Reset sequence complete, waiting for oscillator...");
+
+    /* Verify reset pin is LOW (released) */
+    int reset_state = gpio_pin_get_dt(&config->reset_gpio);
+    LOG_INF("Reset pin current state: %d (should be 0 for released/normal operation)", reset_state);
+
+    /* Check IRQ pin - should be high (inactive) after reset if chip is ready */
+    int irq_state = gpio_pin_get_dt(&config->irq_gpio);
+    LOG_INF("IRQ pin current state: %d (should be 1 for active-low inactive)", irq_state);
+
+    /* Initialize the ST25R200/ST25R100 chip */
     ReturnCode err = st25r200Initialize();
     if (err != RFAL_ERR_NONE) {
-        LOG_ERR("ST25R200 initialization failed: %d", err);
+        LOG_ERR("ST25Rx00 initialization failed: %d", err);
         return -EIO;
     }
 
     /* Verify chip ID */
-    if (!st25r200CheckChipID(&chip_rev)) {
-        LOG_ERR("Chip ID verification failed");
+    if (!st25r200CheckChipID(&chip_id)) {
+        LOG_ERR("Chip ID verification failed (ID=0x%02X)", chip_id);
         return -ENODEV;
     }
-    LOG_INF("ST25R200 detected, revision: 0x%02X", chip_rev);
+    LOG_INF("ST25Rx00 detected, IC ID: 0x%02X", chip_id);
 
     /* Initialize interrupt handling */
     st25r200InitInterrupts();
@@ -88,14 +114,30 @@ static int st25rx00_init(const struct device *dev)
  ******************************************************************************
  */
 
-/* SPI mode: CPOL=0, CPHA=0 (Mode 0) for ST25R200 */
-#define ST25RX00_SPI_OPERATION (SPI_WORD_SET(8) | SPI_TRANSFER_MSB)
+/* SPI mode: CPOL=0, CPHA=1 (Mode 1) for ST25R100/ST25R200 - per ST datasheet */
+#define ST25RX00_SPI_OPERATION (SPI_WORD_SET(8) | SPI_TRANSFER_MSB | SPI_MODE_CPHA)
+
+/*
+ * SPI configuration without automatic CS control.
+ * CS is manually controlled by rfal_platform.c to support multi-byte
+ * SPI sequences required by the RFAL library.
+ */
+#define ST25RX00_SPI_CONFIG(inst)  {                                            \
+    .bus = DEVICE_DT_GET(DT_INST_BUS(inst)),                                    \
+    .config = {                                                                  \
+        .frequency = DT_INST_PROP(inst, spi_max_frequency),                     \
+        .operation = ST25RX00_SPI_OPERATION,                                    \
+        .slave = 0,                                                              \
+        .cs = { .gpio = { .port = NULL }, .delay = 0 },                         \
+    },                                                                           \
+}
 
 #define ST25RX00_INIT(inst)                                                     \
     static struct st25rx00_data st25rx00_data_##inst;                           \
                                                                                 \
     static const struct st25rx00_config st25rx00_config_##inst = {              \
-        .spi = SPI_DT_SPEC_INST_GET(inst, ST25RX00_SPI_OPERATION, 0),            \
+        .spi = ST25RX00_SPI_CONFIG(inst),                                       \
+        .cs_gpio = GPIO_DT_SPEC_INST_GET(inst, cs_gpios),                        \
         .irq_gpio = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),                      \
         .reset_gpio = GPIO_DT_SPEC_INST_GET(inst, reset_gpios),                  \
         .led_field_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, led_field_gpios, {0}),  \

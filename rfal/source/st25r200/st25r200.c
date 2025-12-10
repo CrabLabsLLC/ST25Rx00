@@ -707,21 +707,25 @@ ReturnCode st25r200SetStartGPTimer( uint16_t gpt, uint8_t trigger )
 bool st25r200CheckChipID( uint8_t *rev )
 {
     uint8_t ID;
-    
-    ID = 0;    
+    uint8_t ic_type;
+
+    ID = 0;
     st25r200ReadRegister( ST25R200_REG_IC_ID, &ID );
-    
-    /* Check if IC Identity Register contains ST25R200's IC type code */
-    if( (ID & ST25R200_REG_IC_ID_ic_type_mask) != ST25R200_REG_IC_ID_ic_type_st25r200 )
+
+    ic_type = (ID & ST25R200_REG_IC_ID_ic_type_mask);
+
+    /* Check if IC Identity Register contains ST25R100 or ST25R200 IC type code */
+    if( (ic_type != ST25R200_REG_IC_ID_ic_type_st25r200) &&
+        (ic_type != ST25R200_REG_IC_ID_ic_type_st25r100) )
     {
         return false;
     }
-        
+
     if(rev != NULL)
     {
-        *rev = (ID & ST25R200_REG_IC_ID_ic_rev_mask);
+        *rev = ID;  /* Return full ID byte for diagnostics */
     }
-    
+
     return true;
 }
 

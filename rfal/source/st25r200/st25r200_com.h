@@ -827,6 +827,7 @@
 #define ST25R200_REG_IC_ID_ic_type2                           (1U<<5)
 #define ST25R200_REG_IC_ID_ic_type1                           (1U<<4)
 #define ST25R200_REG_IC_ID_ic_type0                           (1U<<3)
+#define ST25R200_REG_IC_ID_ic_type_st25r100                   (20U<<3)
 #define ST25R200_REG_IC_ID_ic_type_st25r200                   (21U<<3)
 #define ST25R200_REG_IC_ID_ic_type_mask                       (0x1FU<<3)
 #define ST25R200_REG_IC_ID_ic_type_shift                      (3U)

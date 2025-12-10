@@ -31,6 +31,11 @@ static rfalNfcDevice *nfc_device;
 /* API initialization state */
 static bool api_initialized = false;
 
+/* ISO-DEP buffers - protected by requiring single-threaded access to API */
+static rfalIsoDepApduBufFormat isodep_tx_apdu_buf;
+static rfalIsoDepApduBufFormat isodep_rx_apdu_buf;
+static rfalIsoDepBufFormat isodep_tmp_buf;
+
 /*
  ******************************************************************************
  * HELPER FUNCTIONS
@@ -48,6 +53,23 @@ static enum st25rx00_nfca_type get_nfca_type(uint8_t sel_res)
         return ST25RX00_NFCA_NFCDEP;  /* NFC-DEP */
     }
     return ST25RX00_NFCA_OTHER;
+}
+
+/**
+ * @brief Safely copy UID with bounds checking
+ *
+ * @param dst Destination buffer
+ * @param dst_size Size of destination buffer
+ * @param src Source buffer
+ * @param src_len Length of source data
+ * @return Actual number of bytes copied
+ */
+static uint8_t safe_uid_copy(uint8_t *dst, size_t dst_size,
+                             const uint8_t *src, size_t src_len)
+{
+    size_t copy_len = (src_len <= dst_size) ? src_len : dst_size;
+    memcpy(dst, src, copy_len);
+    return (uint8_t)copy_len;
 }
 
 /*
@@ -188,9 +210,10 @@ bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
             switch (nfc_device->type) {
             case RFAL_NFC_LISTEN_TYPE_NFCA:
                 tag_info->tech = ST25RX00_TECH_NFCA;
-                memcpy(tag_info->uid, nfc_device->dev.nfca.nfcId1,
-                       nfc_device->dev.nfca.nfcId1Len);
-                tag_info->uid_len = nfc_device->dev.nfca.nfcId1Len;
+                tag_info->uid_len = safe_uid_copy(
+                    tag_info->uid, sizeof(tag_info->uid),
+                    nfc_device->dev.nfca.nfcId1,
+                    nfc_device->dev.nfca.nfcId1Len);
                 tag_info->sens_res = nfc_device->dev.nfca.sensRes.anticollisionInfo;
                 tag_info->sel_res = nfc_device->dev.nfca.selRes.sak;
                 tag_info->nfca_type = get_nfca_type(tag_info->sel_res);
@@ -202,9 +225,10 @@ bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
 
             case RFAL_NFC_LISTEN_TYPE_NFCB:
                 tag_info->tech = ST25RX00_TECH_NFCB;
-                memcpy(tag_info->uid, nfc_device->dev.nfcb.sensbRes.nfcid0,
-                       RFAL_NFCB_NFCID0_LEN);
-                tag_info->uid_len = RFAL_NFCB_NFCID0_LEN;
+                tag_info->uid_len = safe_uid_copy(
+                    tag_info->uid, sizeof(tag_info->uid),
+                    nfc_device->dev.nfcb.sensbRes.nfcid0,
+                    RFAL_NFCB_NFCID0_LEN);
                 memcpy(&tag_info->dev.nfcb, &nfc_device->dev.nfcb,
                        sizeof(rfalNfcbListenDevice));
                 LOG_INF("NFC-B tag detected");
@@ -212,9 +236,10 @@ bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
 
             case RFAL_NFC_LISTEN_TYPE_NFCV:
                 tag_info->tech = ST25RX00_TECH_NFCV;
-                memcpy(tag_info->uid, nfc_device->dev.nfcv.InvRes.UID,
-                       RFAL_NFCV_UID_LEN);
-                tag_info->uid_len = RFAL_NFCV_UID_LEN;
+                tag_info->uid_len = safe_uid_copy(
+                    tag_info->uid, sizeof(tag_info->uid),
+                    nfc_device->dev.nfcv.InvRes.UID,
+                    RFAL_NFCV_UID_LEN);
                 memcpy(&tag_info->dev.nfcv, &nfc_device->dev.nfcv,
                        sizeof(rfalNfcvListenDevice));
                 LOG_INF("NFC-V tag detected");
@@ -320,9 +345,6 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
     ReturnCode err;
     uint16_t actual_rx_len = 0;
     rfalIsoDepApduTxRxParam param;
-    static rfalIsoDepApduBufFormat tx_apdu_buf;
-    static rfalIsoDepApduBufFormat rx_apdu_buf;
-    static rfalIsoDepBufFormat tmp_buf;
 
     if (nfc_device == NULL) {
         return -ENODEV;
@@ -335,21 +357,22 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
     }
 
     /* Check TX data fits in buffer */
-    if (tx_len > sizeof(tx_apdu_buf.apdu)) {
-        LOG_ERR("TX data too large");
+    if (tx_len > sizeof(isodep_tx_apdu_buf.apdu)) {
+        LOG_ERR("TX data too large: %zu > %zu", tx_len,
+                sizeof(isodep_tx_apdu_buf.apdu));
         return -ENOMEM;
     }
 
     /* Copy TX data to APDU buffer */
-    memcpy(tx_apdu_buf.apdu, tx_buf, tx_len);
+    memcpy(isodep_tx_apdu_buf.apdu, tx_buf, tx_len);
 
     /* Setup transceive parameters using ISO-DEP device info from proto union */
     memset(&param, 0, sizeof(param));
-    param.txBuf = &tx_apdu_buf;
+    param.txBuf = &isodep_tx_apdu_buf;
     param.txBufLen = tx_len;
-    param.rxBuf = &rx_apdu_buf;
+    param.rxBuf = &isodep_rx_apdu_buf;
     param.rxLen = &actual_rx_len;
-    param.tmpBuf = &tmp_buf;
+    param.tmpBuf = &isodep_tmp_buf;
     param.FWT = nfc_device->proto.isoDep.info.FWT;
     param.dFWT = nfc_device->proto.isoDep.info.dFWT;
     param.FSx = nfc_device->proto.isoDep.info.FSx;
@@ -374,12 +397,12 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
         return -EIO;
     }
 
-    /* Copy received data to output buffer */
+    /* Check RX buffer size and copy received data */
     if (actual_rx_len > rx_buf_len) {
-        LOG_ERR("RX buffer too small");
+        LOG_ERR("RX buffer too small: need %u, have %zu", actual_rx_len, rx_buf_len);
         return -ENOMEM;
     }
-    memcpy(rx_buf, rx_apdu_buf.apdu, actual_rx_len);
+    memcpy(rx_buf, isodep_rx_apdu_buf.apdu, actual_rx_len);
 
     if (rx_len != NULL) {
         *rx_len = actual_rx_len;

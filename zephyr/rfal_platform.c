@@ -9,9 +9,23 @@
  */
 
 #include "rfal_platform.h"
-#include <zephyr/irq.h>
 
 LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
+
+/*
+ ******************************************************************************
+ * TIMING CONSTANTS
+ ******************************************************************************
+ */
+
+/** Time for ST25R100 27.12 MHz crystal to stabilize after reset release (ms) */
+#define ST25R100_XTAL_STABILIZATION_MS  100
+
+/** Minimum reset pulse width (ms) - datasheet specifies minimum 10us */
+#define ST25R100_RESET_PULSE_MS         5
+
+/** Delay before asserting reset to ensure clean power-up (ms) */
+#define ST25R100_PRE_RESET_DELAY_MS     10
 
 /*
  ******************************************************************************
@@ -21,8 +35,17 @@ LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
 
 /* Pointer to the device instance - set during initialization */
 static const struct device *st25rx00_dev;
-static struct k_spinlock platform_lock;
-static unsigned int saved_irq_key;
+static struct k_mutex platform_mutex;
+static bool mutex_initialized = false;
+
+/* Work queue for deferring ISR processing */
+static struct k_work irq_work;
+static void (*deferred_isr_callback)(void);
+static volatile bool irq_pending = false;
+
+/* Temporary buffer for same-buffer TX/RX operations (ST25R_COM_SINGLETXRX mode) */
+#define SPI_TEMP_BUF_SIZE 260  /* Larger than ST25R200_FIFO_DEPTH + cmd byte */
+static uint8_t spi_temp_buf[SPI_TEMP_BUF_SIZE];
 
 /*
  ******************************************************************************
@@ -41,7 +64,11 @@ int rfal_platform_init(const struct device *dev)
     /* Store device pointer for platform functions */
     st25rx00_dev = dev;
 
-    /* Spinlocks are zero-initialized by default in Zephyr */
+    /* Initialize mutex for communication protection */
+    if (!mutex_initialized) {
+        k_mutex_init(&platform_mutex);
+        mutex_initialized = true;
+    }
 
     /* Check SPI bus is ready */
     if (!spi_is_ready_dt(&config->spi)) {
@@ -49,12 +76,29 @@ int rfal_platform_init(const struct device *dev)
         return -ENODEV;
     }
 
+    /* Configure CS GPIO - manually controlled for multi-byte transactions */
+    if (!gpio_is_ready_dt(&config->cs_gpio)) {
+        LOG_ERR("CS GPIO not ready");
+        return -ENODEV;
+    }
+
+    ret = gpio_pin_configure_dt(&config->cs_gpio, GPIO_OUTPUT_INACTIVE);
+    if (ret < 0) {
+        LOG_ERR("Failed to configure CS GPIO: %d", ret);
+        return ret;
+    }
+    LOG_DBG("CS GPIO configured: %s pin %d",
+            config->cs_gpio.port->name, config->cs_gpio.pin);
+
     /* Configure reset GPIO */
     if (!gpio_is_ready_dt(&config->reset_gpio)) {
         LOG_ERR("Reset GPIO not ready");
         return -ENODEV;
     }
 
+    /* Configure reset as output, inactive state.
+     * ST25R100: Reset is active-HIGH. External pull-down on PCB ensures chip
+     * stays out of reset when MCU is in reset/boot. */
     ret = gpio_pin_configure_dt(&config->reset_gpio, GPIO_OUTPUT_INACTIVE);
     if (ret < 0) {
         LOG_ERR("Failed to configure reset GPIO: %d", ret);
@@ -111,22 +155,29 @@ int rfal_platform_init(const struct device *dev)
 
 void rfal_platform_protect_comm(void)
 {
-    saved_irq_key = irq_lock();
+    /* Use mutex instead of irq_lock to allow blocking SPI operations.
+     * Only lock if not in ISR context - ISR should not do SPI operations. */
+    if (!k_is_in_isr() && mutex_initialized) {
+        k_mutex_lock(&platform_mutex, K_FOREVER);
+    }
 }
 
 void rfal_platform_unprotect_comm(void)
 {
-    irq_unlock(saved_irq_key);
+    if (!k_is_in_isr() && mutex_initialized) {
+        k_mutex_unlock(&platform_mutex);
+    }
 }
 
 void rfal_platform_protect_irq_status(void)
 {
-    rfal_platform_protect_comm();
+    /* For IRQ status protection, we don't need to do anything special
+     * since we're using a cooperative threading model */
 }
 
 void rfal_platform_unprotect_irq_status(void)
 {
-    rfal_platform_unprotect_comm();
+    /* Nothing to do */
 }
 
 /*
@@ -137,6 +188,8 @@ void rfal_platform_unprotect_irq_status(void)
 
 void rfal_platform_gpio_set(uint32_t pin)
 {
+    ARG_UNUSED(pin);
+
     if (st25rx00_dev == NULL) {
         return;
     }
@@ -149,6 +202,8 @@ void rfal_platform_gpio_set(uint32_t pin)
 
 void rfal_platform_gpio_clear(uint32_t pin)
 {
+    ARG_UNUSED(pin);
+
     if (st25rx00_dev == NULL) {
         return;
     }
@@ -161,6 +216,8 @@ void rfal_platform_gpio_clear(uint32_t pin)
 
 bool rfal_platform_gpio_is_high(uint32_t pin)
 {
+    ARG_UNUSED(pin);
+
     if (st25rx00_dev == NULL) {
         return false;
     }
@@ -177,18 +234,39 @@ bool rfal_platform_gpio_is_high(uint32_t pin)
  ******************************************************************************
  */
 
+/**
+ * Work handler - executes in thread context, safe for SPI operations
+ */
+static void irq_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    /* Clear pending flag BEFORE calling callback to avoid missing new IRQs
+     * that might occur during callback execution */
+    irq_pending = false;
+
+    if (deferred_isr_callback != NULL) {
+        deferred_isr_callback();
+    }
+}
+
+/**
+ * GPIO IRQ handler - runs in ISR context, cannot do SPI
+ * Defers work to system work queue for thread context execution
+ */
 static void rfal_platform_irq_handler(const struct device *dev,
                                       struct gpio_callback *cb,
                                       uint32_t pins)
 {
     ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
     ARG_UNUSED(pins);
 
-    struct st25rx00_data *data = CONTAINER_OF(cb, struct st25rx00_data, irq_cb);
-
-    /* Call the RFAL ISR callback if set */
-    if (data->isr_callback != NULL) {
-        data->isr_callback();
+    /* Submit work to system work queue - this defers execution to thread context
+     * where blocking SPI operations are allowed */
+    if (!irq_pending) {
+        irq_pending = true;
+        k_work_submit(&irq_work);
     }
 }
 
@@ -203,6 +281,9 @@ void rfal_platform_irq_init(void)
     struct st25rx00_data *data = st25rx00_dev->data;
     int ret;
 
+    /* Initialize work item for deferred ISR processing */
+    k_work_init(&irq_work, irq_work_handler);
+
     /* Initialize GPIO callback */
     gpio_init_callback(&data->irq_cb, rfal_platform_irq_handler,
                        BIT(config->irq_gpio.pin));
@@ -214,24 +295,20 @@ void rfal_platform_irq_init(void)
         return;
     }
 
-    /* Configure interrupt on falling edge (IRQ is active LOW) */
+    /* Configure interrupt on edge to active (falling edge for active-low IRQ) */
     ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
     if (ret < 0) {
         LOG_ERR("Failed to configure IRQ interrupt: %d", ret);
         return;
     }
 
-    LOG_DBG("IRQ pin configured successfully");
+    LOG_DBG("IRQ configured with work queue deferral");
 }
 
 void rfal_platform_irq_set_callback(void (*cb)(void))
 {
-    if (st25rx00_dev == NULL) {
-        return;
-    }
-
-    struct st25rx00_data *data = st25rx00_dev->data;
-    data->isr_callback = cb;
+    /* Store callback for deferred execution in work queue handler */
+    deferred_isr_callback = cb;
 }
 
 /*
@@ -248,16 +325,22 @@ uint32_t rfal_platform_timer_create(uint16_t time_ms)
 
 bool rfal_platform_timer_is_expired(uint32_t timer)
 {
-    return ((uint32_t)k_uptime_get() >= timer);
+    /* Use signed comparison to handle 32-bit wraparound correctly.
+     * This works because we assume timers won't be checked more than
+     * ~24 days after creation (half the 49-day wraparound period). */
+    int32_t elapsed = (int32_t)((uint32_t)k_uptime_get() - timer);
+    return (elapsed >= 0);
 }
 
 uint32_t rfal_platform_timer_get_remaining(uint32_t timer)
 {
     uint32_t now = (uint32_t)k_uptime_get();
-    if (now >= timer) {
+    int32_t remaining = (int32_t)(timer - now);
+
+    if (remaining <= 0) {
         return 0;
     }
-    return (timer - now);
+    return (uint32_t)remaining;
 }
 
 /*
@@ -268,12 +351,26 @@ uint32_t rfal_platform_timer_get_remaining(uint32_t timer)
 
 void rfal_platform_spi_select(void)
 {
-    /* CS is handled automatically by SPI subsystem via device tree */
+    if (st25rx00_dev == NULL) {
+        return;
+    }
+
+    const struct st25rx00_config *config = st25rx00_dev->config;
+
+    /* Drive CS LOW (active) - gpio_pin_set_dt handles GPIO_ACTIVE_LOW flag */
+    gpio_pin_set_dt(&config->cs_gpio, 1);
 }
 
 void rfal_platform_spi_deselect(void)
 {
-    /* CS is handled automatically by SPI subsystem via device tree */
+    if (st25rx00_dev == NULL) {
+        return;
+    }
+
+    const struct st25rx00_config *config = st25rx00_dev->config;
+
+    /* Drive CS HIGH (inactive) - gpio_pin_set_dt handles GPIO_ACTIVE_LOW flag */
+    gpio_pin_set_dt(&config->cs_gpio, 0);
 }
 
 int rfal_platform_spi_txrx(const uint8_t *txBuf, uint8_t *rxBuf, uint16_t len)
@@ -285,33 +382,43 @@ int rfal_platform_spi_txrx(const uint8_t *txBuf, uint8_t *rxBuf, uint16_t len)
     const struct st25rx00_config *config = st25rx00_dev->config;
     int ret;
 
-    struct spi_buf tx_buf = {
-        .buf = (void *)txBuf,
-        .len = len
-    };
-    struct spi_buf_set tx_bufs = {
-        .buffers = &tx_buf,
-        .count = 1
-    };
-
-    struct spi_buf rx_buf = {
-        .buf = rxBuf,
-        .len = len
-    };
-    struct spi_buf_set rx_bufs = {
-        .buffers = &rx_buf,
-        .count = 1
-    };
-
     /* Handle different transfer modes */
     if (txBuf != NULL && rxBuf != NULL) {
         /* Full duplex transfer */
-        ret = spi_transceive_dt(&config->spi, &tx_bufs, &rx_bufs);
+        if (txBuf == rxBuf) {
+            /* Same buffer for TX and RX (ST25R_COM_SINGLETXRX mode)
+             * Copy TX data to temp buffer, transceive, then the original
+             * buffer will have the RX data (which is what RFAL expects) */
+            if (len > SPI_TEMP_BUF_SIZE) {
+                LOG_ERR("SPI buffer too large: %d > %d", len, SPI_TEMP_BUF_SIZE);
+                return -ENOMEM;
+            }
+            memcpy(spi_temp_buf, txBuf, len);
+
+            struct spi_buf tx_buf = { .buf = spi_temp_buf, .len = len };
+            struct spi_buf_set tx_bufs = { .buffers = &tx_buf, .count = 1 };
+            struct spi_buf rx_buf = { .buf = rxBuf, .len = len };
+            struct spi_buf_set rx_bufs = { .buffers = &rx_buf, .count = 1 };
+
+            ret = spi_transceive_dt(&config->spi, &tx_bufs, &rx_bufs);
+        } else {
+            /* Different buffers - standard full duplex */
+            struct spi_buf tx_buf = { .buf = (void *)txBuf, .len = len };
+            struct spi_buf_set tx_bufs = { .buffers = &tx_buf, .count = 1 };
+            struct spi_buf rx_buf = { .buf = rxBuf, .len = len };
+            struct spi_buf_set rx_bufs = { .buffers = &rx_buf, .count = 1 };
+
+            ret = spi_transceive_dt(&config->spi, &tx_bufs, &rx_bufs);
+        }
     } else if (txBuf != NULL) {
         /* TX only */
+        struct spi_buf tx_buf = { .buf = (void *)txBuf, .len = len };
+        struct spi_buf_set tx_bufs = { .buffers = &tx_buf, .count = 1 };
         ret = spi_write_dt(&config->spi, &tx_bufs);
     } else if (rxBuf != NULL) {
         /* RX only */
+        struct spi_buf rx_buf = { .buf = rxBuf, .len = len };
+        struct spi_buf_set rx_bufs = { .buffers = &rx_buf, .count = 1 };
         ret = spi_read_dt(&config->spi, &rx_bufs);
     } else {
         return -EINVAL;
@@ -373,5 +480,5 @@ void rfal_platform_error_handle(void)
      * - Enter a safe state
      */
 
-    __ASSERT(0, "RFAL fatal error");
+    /* Don't halt - allow caller to handle error */
 }

@@ -243,6 +243,7 @@ extern "C" {
 /** ST25Rx00 device configuration (from device tree) */
 struct st25rx00_config {
     struct spi_dt_spec spi;
+    struct gpio_dt_spec cs_gpio;           /**< Chip select (manually controlled) */
     struct gpio_dt_spec irq_gpio;
     struct gpio_dt_spec reset_gpio;
     struct gpio_dt_spec led_field_gpio;
@@ -254,9 +255,6 @@ struct st25rx00_config {
 /** ST25Rx00 device runtime data */
 struct st25rx00_data {
     struct gpio_callback irq_cb;
-    void (*isr_callback)(void);
-    unsigned int irq_key;
-    struct k_spinlock lock;
     bool initialized;
 };
 
