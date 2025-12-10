@@ -14,18 +14,23 @@ LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
 
 /*
  ******************************************************************************
- * TIMING CONSTANTS
+ * CONSTANTS
  ******************************************************************************
  */
 
-/** Time for ST25R100 27.12 MHz crystal to stabilize after reset release (ms) */
-#define ST25R100_XTAL_STABILIZATION_MS  100
+/**
+ * SPI temporary buffer size for same-buffer TX/RX operations.
+ * Must be larger than ST25R200 FIFO depth (256 bytes) plus command overhead.
+ * Used when ST25R_COM_SINGLETXRX mode requires TX and RX in the same buffer.
+ */
+#define SPI_TEMP_BUF_SIZE               (256U + 4U)
 
-/** Minimum reset pulse width (ms) - datasheet specifies minimum 10us */
-#define ST25R100_RESET_PULSE_MS         5
-
-/** Delay before asserting reset to ensure clean power-up (ms) */
-#define ST25R100_PRE_RESET_DELAY_MS     10
+/**
+ * Maximum timer duration supported (in milliseconds).
+ * Using signed comparison for wraparound handling limits us to ~24 days.
+ * This is sufficient for all NFC timing requirements.
+ */
+#define PLATFORM_TIMER_MAX_MS           (INT32_MAX / 2)
 
 /*
  ******************************************************************************
@@ -33,18 +38,25 @@ LOG_MODULE_REGISTER(rfal_platform, CONFIG_ST25RX00_LOG_LEVEL);
  ******************************************************************************
  */
 
-/* Pointer to the device instance - set during initialization */
+/** Pointer to the device instance - set during initialization */
 static const struct device *st25rx00_dev;
+
+/** Mutex for protecting SPI communication */
 static struct k_mutex platform_mutex;
+
+/** Flag indicating if mutex has been initialized */
 static bool mutex_initialized = false;
 
-/* Work queue for deferring ISR processing */
+/** Work item for deferring ISR processing to thread context */
 static struct k_work irq_work;
+
+/** Callback function to invoke from work handler */
 static void (*deferred_isr_callback)(void);
+
+/** Flag to prevent duplicate work submissions */
 static volatile bool irq_pending = false;
 
-/* Temporary buffer for same-buffer TX/RX operations (ST25R_COM_SINGLETXRX mode) */
-#define SPI_TEMP_BUF_SIZE 260  /* Larger than ST25R200_FIFO_DEPTH + cmd byte */
+/** Temporary buffer for same-buffer SPI TX/RX operations */
 static uint8_t spi_temp_buf[SPI_TEMP_BUF_SIZE];
 
 /*
@@ -315,30 +327,65 @@ void rfal_platform_irq_set_callback(void (*cb)(void))
  ******************************************************************************
  * TIMER FUNCTIONS
  ******************************************************************************
+ *
+ * Timer Implementation Notes:
+ *
+ * The RFAL library uses timers for NFC protocol timing. Timers are created
+ * with a duration in milliseconds and can be checked for expiration.
+ *
+ * Implementation uses k_uptime_get() which returns monotonically increasing
+ * milliseconds since boot. We store the expiration time and use signed
+ * comparison to handle 32-bit wraparound correctly.
+ *
+ * Wraparound Handling:
+ * - k_uptime_get() wraps at ~49 days (2^32 ms)
+ * - Using signed comparison handles wraparound for durations up to ~24 days
+ * - NFC timings are typically microseconds to seconds, so this is safe
  */
 
+/**
+ * @brief Create a timer that expires after specified milliseconds
+ *
+ * @param time_ms Duration in milliseconds (max ~24 days for wraparound safety)
+ * @return Timer handle (expiration timestamp)
+ */
 uint32_t rfal_platform_timer_create(uint16_t time_ms)
 {
-    /* Return the expiration time in milliseconds */
-    return (uint32_t)(k_uptime_get() + time_ms);
+    uint32_t now = (uint32_t)k_uptime_get();
+    return now + (uint32_t)time_ms;
 }
 
+/**
+ * @brief Check if a timer has expired
+ *
+ * Uses signed comparison to correctly handle 32-bit wraparound.
+ * The comparison (now - expiration) >= 0 works because:
+ * - If not expired: (now - expiration) is negative (large positive unsigned)
+ * - If expired: (now - expiration) is positive or zero
+ *
+ * @param timer Timer handle from rfal_platform_timer_create()
+ * @return true if timer has expired, false otherwise
+ */
 bool rfal_platform_timer_is_expired(uint32_t timer)
 {
-    /* Use signed comparison to handle 32-bit wraparound correctly.
-     * This works because we assume timers won't be checked more than
-     * ~24 days after creation (half the 49-day wraparound period). */
-    int32_t elapsed = (int32_t)((uint32_t)k_uptime_get() - timer);
-    return (elapsed >= 0);
+    uint32_t now = (uint32_t)k_uptime_get();
+    int32_t diff = (int32_t)(now - timer);
+    return (diff >= 0);
 }
 
+/**
+ * @brief Get remaining time until timer expiration
+ *
+ * @param timer Timer handle from rfal_platform_timer_create()
+ * @return Remaining milliseconds, 0 if already expired
+ */
 uint32_t rfal_platform_timer_get_remaining(uint32_t timer)
 {
     uint32_t now = (uint32_t)k_uptime_get();
     int32_t remaining = (int32_t)(timer - now);
 
     if (remaining <= 0) {
-        return 0;
+        return 0U;
     }
     return (uint32_t)remaining;
 }

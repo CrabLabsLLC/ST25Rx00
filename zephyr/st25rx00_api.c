@@ -6,6 +6,15 @@
 /**
  * @file st25rx00_api.c
  * @brief ST25Rx00 NFC Reader Public API Implementation
+ *
+ * This module provides a thread-safe API for NFC operations. All public
+ * functions are protected by a mutex to ensure safe concurrent access
+ * from multiple threads.
+ *
+ * Thread Safety:
+ * - All public API functions acquire api_mutex before accessing shared state
+ * - The worker function (st25rx00_worker) should be called from a single thread
+ * - ISO-DEP transceive operations block until completion
  */
 
 #include "st25rx00.h"
@@ -22,18 +31,25 @@ LOG_MODULE_REGISTER(st25rx00_api, CONFIG_ST25RX00_LOG_LEVEL);
  ******************************************************************************
  */
 
-/* NFC discovery parameters */
+/** Mutex protecting all API state */
+static K_MUTEX_DEFINE(api_mutex);
+
+/** NFC discovery parameters - protected by api_mutex */
 static rfalNfcDiscoverParam discover_param;
 
-/* Current NFC device */
+/** Current NFC device - protected by api_mutex */
 static rfalNfcDevice *nfc_device;
 
-/* API initialization state */
+/** API initialization state - protected by api_mutex */
 static bool api_initialized = false;
 
-/* ISO-DEP buffers - protected by requiring single-threaded access to API */
+/** ISO-DEP TX APDU buffer - protected by api_mutex */
 static rfalIsoDepApduBufFormat isodep_tx_apdu_buf;
+
+/** ISO-DEP RX APDU buffer - protected by api_mutex */
 static rfalIsoDepApduBufFormat isodep_rx_apdu_buf;
+
+/** ISO-DEP temporary buffer - protected by api_mutex */
 static rfalIsoDepBufFormat isodep_tmp_buf;
 
 /*
@@ -81,8 +97,12 @@ static uint8_t safe_uid_copy(uint8_t *dst, size_t dst_size,
 int st25rx00_nfc_init(void)
 {
     ReturnCode err;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     if (api_initialized) {
+        k_mutex_unlock(&api_mutex);
         return 0;  /* Already initialized */
     }
 
@@ -90,7 +110,8 @@ int st25rx00_nfc_init(void)
     err = rfalNfcInitialize();
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("RFAL NFC initialization failed: %d", err);
-        return -EIO;
+        ret = -EIO;
+        goto unlock;
     }
 
     /* Set default discovery parameters */
@@ -109,29 +130,42 @@ int st25rx00_nfc_init(void)
 
     api_initialized = true;
     LOG_INF("ST25Rx00 NFC API initialized");
-    return 0;
+
+unlock:
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 int st25rx00_nfc_deinit(void)
 {
+    k_mutex_lock(&api_mutex, K_FOREVER);
+
     if (!api_initialized) {
+        k_mutex_unlock(&api_mutex);
         return 0;
     }
 
     rfalNfcDeactivate(RFAL_NFC_DEACTIVATE_IDLE);
+    nfc_device = NULL;
     api_initialized = false;
 
     LOG_INF("ST25Rx00 NFC API deinitialized");
+
+    k_mutex_unlock(&api_mutex);
     return 0;
 }
 
 int st25rx00_discover_start(const struct st25rx00_discover_cfg *cfg)
 {
     ReturnCode err;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     if (!api_initialized) {
         LOG_ERR("API not initialized");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto unlock;
     }
 
     /* Apply custom configuration if provided */
@@ -162,32 +196,44 @@ int st25rx00_discover_start(const struct st25rx00_discover_cfg *cfg)
     err = rfalNfcDiscover(&discover_param);
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("Failed to start discovery: %d", err);
-        return -EIO;
+        ret = -EIO;
+        goto unlock;
     }
 
     LOG_DBG("NFC discovery started");
-    return 0;
+
+unlock:
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 int st25rx00_discover_stop(void)
 {
     ReturnCode err;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     err = rfalNfcDeactivate(RFAL_NFC_DEACTIVATE_IDLE);
     if (err != RFAL_ERR_NONE) {
         LOG_WRN("Stop discovery failed: %d", err);
-        return -EIO;
+        ret = -EIO;
     }
 
     nfc_device = NULL;
     LOG_DBG("NFC discovery stopped");
-    return 0;
+
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
 {
     rfalNfcState state;
     ReturnCode err;
+    bool result = false;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     /* Run the NFC state machine */
     rfalNfcWorker();
@@ -200,7 +246,7 @@ bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
         err = rfalNfcGetActiveDevice(&nfc_device);
         if (err != RFAL_ERR_NONE || nfc_device == NULL) {
             LOG_ERR("Failed to get active device: %d", err);
-            return false;
+            goto unlock;
         }
 
         /* Fill tag_info if provided */
@@ -252,43 +298,67 @@ bool st25rx00_worker(struct st25rx00_tag_info *tag_info)
             }
         }
 
-        return true;
+        result = true;
     }
 
-    return false;
+unlock:
+    k_mutex_unlock(&api_mutex);
+    return result;
 }
 
 int st25rx00_get_active_device(struct st25rx00_tag_info *tag_info)
 {
-    if (nfc_device == NULL) {
-        return -ENODEV;
-    }
+    int ret;
 
     if (tag_info == NULL) {
         return -EINVAL;
     }
 
-    /* Re-populate tag info from current device */
-    return st25rx00_worker(tag_info) ? 0 : -ENODEV;
+    k_mutex_lock(&api_mutex, K_FOREVER);
+
+    if (nfc_device == NULL) {
+        ret = -ENODEV;
+    } else {
+        /* Worker will fill tag_info - but we already hold the lock
+         * so call the internal population logic directly */
+        ret = 0;  /* Success - device exists */
+    }
+
+    k_mutex_unlock(&api_mutex);
+
+    if (ret == 0) {
+        /* Re-populate tag info from current device (acquires lock internally) */
+        return st25rx00_worker(tag_info) ? 0 : -ENODEV;
+    }
+
+    return ret;
 }
 
 int st25rx00_deactivate(void)
 {
     ReturnCode err;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     err = rfalNfcDeactivate(RFAL_NFC_DEACTIVATE_DISCOVERY);
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("Deactivation failed: %d", err);
-        return -EIO;
+        ret = -EIO;
     }
 
     nfc_device = NULL;
-    return 0;
+
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 int st25rx00_field_control(bool enable)
 {
     ReturnCode err;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     if (enable) {
         err = rfalFieldOnAndStartGT();
@@ -298,11 +368,13 @@ int st25rx00_field_control(bool enable)
 
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("Field control failed: %d", err);
-        return -EIO;
+        ret = -EIO;
+    } else {
+        LOG_DBG("RF field %s", enable ? "enabled" : "disabled");
     }
 
-    LOG_DBG("RF field %s", enable ? "enabled" : "disabled");
-    return 0;
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 int st25rx00_transceive(const uint8_t *tx_buf, size_t tx_len,
@@ -311,9 +383,13 @@ int st25rx00_transceive(const uint8_t *tx_buf, size_t tx_len,
 {
     ReturnCode err;
     uint16_t actual_rx_len = 0;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     if (nfc_device == NULL) {
-        return -ENODEV;
+        ret = -ENODEV;
+        goto unlock;
     }
 
     err = rfalTransceiveBlockingTxRx(
@@ -328,14 +404,17 @@ int st25rx00_transceive(const uint8_t *tx_buf, size_t tx_len,
 
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("Transceive failed: %d", err);
-        return -EIO;
+        ret = -EIO;
+        goto unlock;
     }
 
     if (rx_len != NULL) {
         *rx_len = actual_rx_len;
     }
 
-    return 0;
+unlock:
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
 
 int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
@@ -345,22 +424,28 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
     ReturnCode err;
     uint16_t actual_rx_len = 0;
     rfalIsoDepApduTxRxParam param;
+    int ret = 0;
+
+    k_mutex_lock(&api_mutex, K_FOREVER);
 
     if (nfc_device == NULL) {
-        return -ENODEV;
+        ret = -ENODEV;
+        goto unlock;
     }
 
     /* Check if device supports ISO-DEP */
     if (nfc_device->rfInterface != RFAL_NFC_INTERFACE_ISODEP) {
         LOG_ERR("Device does not support ISO-DEP");
-        return -ENOTSUP;
+        ret = -ENOTSUP;
+        goto unlock;
     }
 
     /* Check TX data fits in buffer */
     if (tx_len > sizeof(isodep_tx_apdu_buf.apdu)) {
         LOG_ERR("TX data too large: %zu > %zu", tx_len,
                 sizeof(isodep_tx_apdu_buf.apdu));
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto unlock;
     }
 
     /* Copy TX data to APDU buffer */
@@ -383,7 +468,8 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
     err = rfalIsoDepStartApduTransceive(param);
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("ISO-DEP start transceive failed: %d", err);
-        return -EIO;
+        ret = -EIO;
+        goto unlock;
     }
 
     /* Poll for completion */
@@ -394,13 +480,15 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
 
     if (err != RFAL_ERR_NONE) {
         LOG_ERR("ISO-DEP transceive failed: %d", err);
-        return -EIO;
+        ret = -EIO;
+        goto unlock;
     }
 
     /* Check RX buffer size and copy received data */
     if (actual_rx_len > rx_buf_len) {
         LOG_ERR("RX buffer too small: need %u, have %zu", actual_rx_len, rx_buf_len);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto unlock;
     }
     memcpy(rx_buf, isodep_rx_apdu_buf.apdu, actual_rx_len);
 
@@ -408,5 +496,7 @@ int st25rx00_isodep_transceive(const uint8_t *tx_buf, size_t tx_len,
         *rx_len = actual_rx_len;
     }
 
-    return 0;
+unlock:
+    k_mutex_unlock(&api_mutex);
+    return ret;
 }
